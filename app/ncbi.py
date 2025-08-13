@@ -138,7 +138,8 @@ class NCBIClient:
         """
         if not xml_text.strip():
             return {}
-        root = etree.fromstring(xml_text.encode("utf-8"))
+        parser = etree.XMLParser(recover=True)
+        root = etree.fromstring(xml_text.encode("utf-8"), parser=parser)
         out: Dict[str, str] = {}
         for art in root.findall(".//PubmedArticle"):
             pmid = art.findtext(".//PMID")
@@ -201,7 +202,8 @@ class NCBIClient:
             xml = await self._get_text(c, url, params)
 
         try:
-            root = etree.fromstring(xml.encode("utf-8"))
+            parser = etree.XMLParser(recover=True)
+            root = etree.fromstring(xml.encode("utf-8"), parser=parser)
             out: Dict[str, str] = {}
             for ls in root.findall(".//LinkSet"):
                 pmid = ls.findtext(".//IdList/Id")
@@ -245,53 +247,103 @@ class NCBIClient:
     @staticmethod
     def parse_pmc_sections(xml_text: str) -> Dict[str, Dict[str, str]]:
         """
-        Extract high-signal sections per PMCID:
-          returns {
+        Robustly extract high-signal sections per PMCID from PMC NXML.
+
+        Returns:
+          {
             'PMCID_NUM': {
               'Results': '...',
               'Methods': '...',
               'Discussion': '...',
               'Conclusion': '...',
               'Limitations': '...'
-            }
+            },
+            ...
           }
-        Section title matching is case-insensitive; merges subsection text.
+
+        Notes:
+        - Namespace-agnostic (uses local-name()).
+        - Accepts PMCID in forms like 'PMC12345' or just '12345'.
+        - Uses <sec sec-type> and/or <title> to identify section names.
         """
-        if not xml_text.strip():
+        if not xml_text or not xml_text.strip():
             return {}
-        root = etree.fromstring(xml_text.encode("utf-8"))
+
+        try:
+            parser = etree.XMLParser(recover=True)
+            root = etree.fromstring(xml_text.encode("utf-8"), parser=parser)
+        except Exception:
+            return {}
+
         wanted = ("results", "methods", "discussion", "conclusion", "limitations")
         out: Dict[str, Dict[str, str]] = {}
 
-        for art in root.findall(".//article"):
-            # derive PMCID (numeric)
-            pmcid = None
-            for aid in art.findall(".//article-id"):
-                if (aid.get("pub-id-type") or "").lower() == "pmcid" and aid.text:
-                    pmcid = aid.text.replace("PMC", "").strip()
-                    break
+        # Find all <article> elements regardless of namespace
+        articles = root.xpath('//*[local-name()="article"]')
+        for art in articles:
+            # PMCID: prefer article-id[@pub-id-type="pmcid"]; fallback to any article-id text containing PMC
+            pmcid_txts = art.xpath(
+                './/*[local-name()="article-id" and translate(@pub-id-type,"PMCID","pmcid")="pmcid"]/text()'
+            )
+            pmcid: Optional[str] = None
+            if pmcid_txts:
+                pmcid = pmcid_txts[0].strip()
+            else:
+                # fallback: any article-id text like 'PMC9999999'
+                any_ids = [t.strip() for t in art.xpath('.//*[local-name()="article-id"]/text()') if t and t.strip()]
+                for t in any_ids:
+                    m = re.search(r"PMC?(\d+)", t, re.IGNORECASE)
+                    if m:
+                        pmcid = m.group(1)
+                        break
+
             if not pmcid:
-                id_el = art.find(".//article-id")
-                pmcid = id_el.text.replace("PMC", "").strip() if id_el is not None and id_el.text else None
+                # last resort: look for an 'id' element with PMC text
+                any_txts = [t.strip() for t in art.xpath('.//*[local-name()="id"]/text()') if t and t.strip()]
+                for t in any_txts:
+                    m = re.search(r"PMC?(\d+)", t, re.IGNORECASE)
+                    if m:
+                        pmcid = m.group(1)
+                        break
+
             if not pmcid:
+                # can't identify PMCID → skip article
                 continue
 
             buckets: Dict[str, List[str]] = {k.capitalize(): [] for k in wanted}
-            for sec in art.findall(".//sec"):
-                title_el = sec.find("title")
-                title = (title_el.text or "").strip().lower() if title_el is not None else ""
-                # concatenate all <p> text within this section (including nested)
-                text = " ".join(
-                    etree.tostring(p, method="text", encoding="unicode").strip()
-                    for p in sec.findall(".//p")
-                ).strip()
-                if not text:
-                    continue
-                for w in wanted:
-                    if w in title:
-                        buckets[w.capitalize()].append(text)
-                        break
 
-            out[pmcid] = {k: "\n".join(v).strip() for k, v in buckets.items() if v}
+            # Walk all <sec> regardless of nesting
+            secs = art.xpath('.//*[local-name()="sec"]')
+            for sec in secs:
+                # Prefer @sec-type if present, else the <title> text
+                sec_type = (sec.get("sec-type") or "").strip().lower()
+                title_txt = " ".join(
+                    t.strip() for t in sec.xpath('.//*[local-name()="title"]/text()') if t and t.strip()
+                ).lower()
+
+                # Capture all paragraph text within the section (including nested)
+                para_text = " ".join(
+                    t.strip() for t in sec.xpath('.//*[local-name()="p"]//text()') if t and t.strip()
+                ).strip()
+                if not para_text:
+                    continue
+
+                # Decide the bucket name
+                chosen: Optional[str] = None
+                if sec_type in wanted:
+                    chosen = sec_type
+                else:
+                    for w in wanted:
+                        if w in title_txt:
+                            chosen = w
+                            break
+
+                if chosen:
+                    buckets[chosen.capitalize()].append(para_text)
+
+            # Materialize only non-empty sections
+            realized = {k: "\n".join(v).strip() for k, v in buckets.items() if v}
+            if realized:
+                out[pmcid] = realized
 
         return out
