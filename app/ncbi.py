@@ -263,7 +263,7 @@ class NCBIClient:
 
         Notes:
         - Namespace-agnostic (uses local-name()).
-        - Accepts PMCID in forms like 'PMC12345' or just '12345'.
+        - Normalizes PMCID keys to the numeric part (e.g., 'PMC12345' -> '12345').
         - Uses <sec sec-type> and/or <title> to identify section names.
         """
         if not xml_text or not xml_text.strip():
@@ -281,15 +281,18 @@ class NCBIClient:
         # Find all <article> elements regardless of namespace
         articles = root.xpath('//*[local-name()="article"]')
         for art in articles:
-            # PMCID: prefer article-id[@pub-id-type="pmcid"]; fallback to any article-id text containing PMC
+            # Prefer article-id[@pub-id-type="pmcid"]
             pmcid_txts = art.xpath(
                 './/*[local-name()="article-id" and translate(@pub-id-type,"PMCID","pmcid")="pmcid"]/text()'
             )
             pmcid: Optional[str] = None
             if pmcid_txts:
                 pmcid = pmcid_txts[0].strip()
+                # normalize to numeric only
+                if pmcid.upper().startswith("PMC"):
+                    pmcid = pmcid[3:]
             else:
-                # fallback: any article-id text like 'PMC9999999'
+                # fallback: any article-id text like 'PMC9999999' or '9999999'
                 any_ids = [t.strip() for t in art.xpath('.//*[local-name()="article-id"]/text()') if t and t.strip()]
                 for t in any_ids:
                     m = re.search(r"PMC?(\d+)", t, re.IGNORECASE)
@@ -298,7 +301,7 @@ class NCBIClient:
                         break
 
             if not pmcid:
-                # last resort: look for an 'id' element with PMC text
+                # last resort: look for any <id> text with PMC pattern
                 any_txts = [t.strip() for t in art.xpath('.//*[local-name()="id"]/text()') if t and t.strip()]
                 for t in any_txts:
                     m = re.search(r"PMC?(\d+)", t, re.IGNORECASE)
